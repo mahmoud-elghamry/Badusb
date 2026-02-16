@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BadUSB Control Panel</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="app">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-left">
+                <div class="logo">⚡</div>
+                <h1>BadUSB<span class="accent">Panel</span></h1>
+            </div>
+            <div class="header-right">
+                <div class="status-indicator" id="statusDot"></div>
+                <span class="status-text" id="statusText">Idle</span>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <div class="content">
+            <!-- Sidebar: Payload List -->
+            <aside class="sidebar">
+                <div class="sidebar-header">
+                    <h2>Payloads</h2>
+                    <button class="btn btn-icon" id="btnNew" title="New Payload">+</button>
+                </div>
+                <div class="payload-list" id="payloadList">
+                    <!-- populated by JS -->
+                </div>
+                <div class="storage-info" id="storageInfo"></div>
+            </aside>
+
+            <!-- Editor Panel -->
+            <main class="editor-panel">
+                <div class="editor-toolbar">
+                    <input type="text" class="input-name" id="payloadName" placeholder="payload_name.ducky">
+                    <div class="toolbar-actions">
+                        <button class="btn btn-primary" id="btnSave">💾 Save</button>
+                        <button class="btn btn-success" id="btnRun">▶ Run</button>
+                        <button class="btn btn-danger" id="btnStop" disabled>⏹ Stop</button>
+                        <button class="btn btn-danger-outline" id="btnDelete">🗑 Delete</button>
+                    </div>
+                </div>
+                <textarea class="editor" id="editor" placeholder="REM Enter your DuckyScript here...&#10;DELAY 1000&#10;GUI r&#10;DELAY 500&#10;STRING notepad&#10;ENTER&#10;DELAY 1000&#10;STRING Hello from BadUSB!" spellcheck="false"></textarea>
+
+                <!-- Live Execute -->
+                <div class="live-section">
+                    <h3>⚡ Live Execute</h3>
+                    <textarea class="editor editor-live" id="liveEditor" placeholder="Type DuckyScript to execute immediately..." spellcheck="false"></textarea>
+                    <button class="btn btn-warning" id="btnLive">⚡ Execute Live</button>
+                </div>
+            </main>
+
+            <!-- Settings Panel -->
+            <aside class="settings-panel">
+                <h2>⚙ Settings</h2>
+
+                <div class="setting-group">
+                    <label>Auto-Run Payload</label>
+                    <select id="autorunSelect">
+                        <option value="">— None —</option>
+                    </select>
+                    <button class="btn btn-sm" id="btnAutorun">Set</button>
+                </div>
+
+                <div class="setting-group">
+                    <h3>Device Info</h3>
+                    <div class="info-row"><span>SSID:</span><span id="infoSSID">—</span></div>
+                    <div class="info-row"><span>IP:</span><span id="infoIP">—</span></div>
+                    <div class="info-row"><span>Storage:</span><span id="infoStorage">—</span></div>
+                </div>
+
+                <div class="setting-group">
+                    <h3>Quick Payloads</h3>
+                    <button class="btn btn-sm btn-full" id="btnTemplate1">📝 Open Notepad</button>
+                    <button class="btn btn-sm btn-full" id="btnTemplate2">🌐 Open Browser</button>
+                    <button class="btn btn-sm btn-full" id="btnTemplate3">💻 Open Terminal</button>
+                </div>
+            </aside>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
