@@ -32,3 +32,6 @@ bool duckyIsRunning();
 
 /// Get the current execution status.
 DuckyStatus duckyGetStatus();
+
+/// Get the last parser/execution error, if any.
+String duckyGetLastError();

@@ -11,8 +11,13 @@
 
 static DNSServer sDns;
 static String sSSID;
+static bool sStarted = false;
 
 void wifiInit() {
+  if (sStarted) {
+    return;
+  }
+
   // Build SSID from MAC suffix
   uint8_t mac[6];
   WiFi.macAddress(mac);
@@ -25,9 +30,16 @@ void wifiInit() {
 
   // Start DNS server for captive portal — redirect all domains to us
   sDns.start(53, "*", WiFi.softAPIP());
+  sStarted = true;
 
   Serial.printf("[WiFi] AP started — SSID: %s  IP: %s\n", sSSID.c_str(),
                 WiFi.softAPIP().toString().c_str());
+}
+
+void wifiProcess() {
+  if (sStarted) {
+    sDns.processNextRequest();
+  }
 }
 
 String wifiGetSSID() { return sSSID; }

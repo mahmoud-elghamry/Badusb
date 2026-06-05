@@ -1,5 +1,5 @@
 // ============================================================
-//  BadUSB ESP32-S3 — Main Entry Point
+//  ESP32-S3 HID Lab - Main Entry Point
 // ============================================================
 //
 //  Boot Safety Logic:
@@ -19,7 +19,7 @@
 
 
 // --- Boot mode ---
-enum BootMode { MODE_ATTACK, MODE_CONFIG };
+enum BootMode { MODE_HID, MODE_CONFIG };
 
 static BootMode detectBootMode();
 static void blinkLED(int count, int intervalMs);
@@ -31,7 +31,7 @@ static void blinkLED(int count, int intervalMs);
 void setup() {
   Serial.begin(115200);
   delay(100);
-  Serial.println("\n=== BadUSB ESP32-S3 ===");
+  Serial.println("\n=== ESP32-S3 HID Lab ===");
 
   // LED & button pins
   pinMode(LED_PIN, OUTPUT);
@@ -54,7 +54,7 @@ void setup() {
 
   if (mode == MODE_CONFIG) {
     // --- CONFIG MODE ---
-    Serial.println("[Boot] CONFIG MODE — Wi-Fi + Web UI only");
+    Serial.println("[Boot] CONFIG MODE - Wi-Fi + Web UI only");
     digitalWrite(LED_PIN, HIGH); // solid LED = config mode
 
     wifiInit();
@@ -64,10 +64,14 @@ void setup() {
                   wifiGetSSID().c_str(), WIFI_PASSWORD);
     Serial.printf("[Boot] Open http://%s in your browser\n",
                   wifiGetIP().c_str());
+    if (!isAdminTokenConfigured()) {
+      Serial.println("[Boot] Web admin token is not configured yet.");
+      Serial.println("[Boot] Open the panel and create a token before using APIs.");
+    }
 
   } else {
-    // --- ATTACK MODE ---
-    Serial.println("[Boot] ATTACK MODE — Initializing USB HID");
+    // --- HID MODE ---
+    Serial.println("[Boot] HID MODE - Initializing USB HID");
 
     // Initialize USB HID (keyboard + mouse)
     initUSB();
@@ -103,6 +107,9 @@ void setup() {
     webServerInit();
     Serial.printf("[Boot] Wi-Fi active in background: %s\n",
                   wifiGetSSID().c_str());
+    if (!isAdminTokenConfigured()) {
+      Serial.println("[Boot] Web admin token is not configured yet.");
+    }
   }
 
   Serial.println("[Boot] Setup complete.\n");
@@ -113,6 +120,7 @@ void setup() {
 // ================================================================
 
 void loop() {
+  wifiProcess();
   // FreeRTOS handles the parser task.
   // Wi-Fi + Web server run on the other core.
   // Nothing needed in loop — yield to scheduler.
@@ -148,7 +156,7 @@ static BootMode detectBootMode() {
     return MODE_CONFIG;
   }
 
-  return MODE_ATTACK;
+  return MODE_HID;
 }
 
 // ================================================================

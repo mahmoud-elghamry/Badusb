@@ -1,5 +1,5 @@
 // ============================================================
-//  DuckyScript Parser — Non-blocking FreeRTOS-based Interpreter
+//  DuckyScript Parser - FreeRTOS-based interpreter
 // ============================================================
 
 #include "ducky_parser.h"
@@ -7,34 +7,129 @@
 #include "keyboard_layout.h"
 #include "usb_hid.h"
 
-
 #include <LittleFS.h>
-#include <vector>
 
-// --- Internal state (protected by mutex) ---
 static SemaphoreHandle_t sMutex = nullptr;
 static TaskHandle_t sTaskHandle = nullptr;
 static volatile DuckyStatus sStatus = DuckyStatus::IDLE;
 static volatile bool sAbort = false;
 static String sScript;
+static String sLastError;
 static DuckyCallback sCallback = nullptr;
 
-// --- Forward declarations ---
 static void parserTask(void *param);
-static void executeLine(const String &line, int defaultDelay, String &lastLine);
+static bool executeLine(const String &line, String &error);
 static uint8_t resolveKey(const String &keyName);
 static uint8_t resolveModifier(const String &modName);
 static void reportStatus(int line, int total, DuckyStatus st);
+
+static void setStatus(DuckyStatus status) { sStatus = status; }
+
+static void setLastError(const String &error) {
+  if (sMutex && xSemaphoreTake(sMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    sLastError = error;
+    xSemaphoreGive(sMutex);
+  } else {
+    sLastError = error;
+  }
+}
+
+static bool parseLong(const String &input, long &value) {
+  String clean = input;
+  clean.trim();
+  if (clean.isEmpty()) {
+    return false;
+  }
+
+  char *end = nullptr;
+  value = strtol(clean.c_str(), &end, 10);
+  return end && *end == '\0';
+}
+
+static bool parseLongInRange(const String &input, long minValue, long maxValue,
+                             long &value) {
+  if (!parseLong(input, value)) {
+    return false;
+  }
+  return value >= minValue && value <= maxValue;
+}
+
+static bool waitWithAbort(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    if (sAbort) {
+      return false;
+    }
+    unsigned long elapsed = millis() - start;
+    unsigned long remaining = ms - elapsed;
+    unsigned long slice = remaining > 25 ? 25 : remaining;
+    vTaskDelay(pdMS_TO_TICKS(slice));
+  }
+  return true;
+}
+
+static int countLines(const String &script) {
+  if (script.isEmpty()) {
+    return 0;
+  }
+
+  int lines = 1;
+  for (size_t i = 0; i < script.length(); i++) {
+    if (script.charAt(i) == '\n') {
+      lines++;
+    }
+  }
+  return lines;
+}
+
+static bool nextLine(const String &script, size_t &cursor, String &line) {
+  if (cursor >= script.length()) {
+    return false;
+  }
+
+  int next = script.indexOf('\n', cursor);
+  if (next < 0) {
+    line = script.substring(cursor);
+    cursor = script.length();
+  } else {
+    line = script.substring(cursor, next);
+    cursor = next + 1;
+  }
+  line.trim();
+  return true;
+}
+
+static bool isCommentOrBlank(const String &line) {
+  if (line.isEmpty() || line.startsWith("//")) {
+    return true;
+  }
+
+  String upper = line;
+  upper.toUpperCase();
+  return upper == "REM" || upper.startsWith("REM ");
+}
 
 // ================================================================
 //  Public API
 // ================================================================
 
-void duckyInit() { sMutex = xSemaphoreCreateMutex(); }
+void duckyInit() {
+  if (!sMutex) {
+    sMutex = xSemaphoreCreateMutex();
+  }
+}
 
 bool duckyExecute(const String &script, DuckyCallback cb) {
-  if (xSemaphoreTake(sMutex, pdMS_TO_TICKS(100)) != pdTRUE)
+  if (!sMutex) {
+    duckyInit();
+  }
+  if (!sMutex || script.length() > MAX_PAYLOAD_SIZE) {
     return false;
+  }
+
+  if (xSemaphoreTake(sMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+    return false;
+  }
 
   if (sStatus == DuckyStatus::RUNNING) {
     xSemaphoreGive(sMutex);
@@ -43,26 +138,37 @@ bool duckyExecute(const String &script, DuckyCallback cb) {
 
   sScript = script;
   sCallback = cb;
+  sLastError = "";
   sAbort = false;
   sStatus = DuckyStatus::RUNNING;
   xSemaphoreGive(sMutex);
 
-  // Create (or re-create) the parser task
-  if (sTaskHandle != nullptr) {
-    vTaskDelete(sTaskHandle);
-    sTaskHandle = nullptr;
-  }
+  BaseType_t created = xTaskCreatePinnedToCore(
+      parserTask, "DuckyParser", PARSER_TASK_STACK, nullptr, PARSER_TASK_PRIO,
+      &sTaskHandle, PARSER_TASK_CORE);
 
-  xTaskCreatePinnedToCore(parserTask, "DuckyParser", PARSER_TASK_STACK, nullptr,
-                          PARSER_TASK_PRIO, &sTaskHandle, PARSER_TASK_CORE);
+  if (created != pdPASS) {
+    setLastError("Failed to create parser task");
+    setStatus(DuckyStatus::ERROR);
+    sTaskHandle = nullptr;
+    return false;
+  }
 
   return true;
 }
 
 bool duckyExecuteFile(const String &filePath, DuckyCallback cb) {
   File f = LittleFS.open(filePath, "r");
-  if (!f)
+  if (!f) {
+    setLastError("Payload file could not be opened");
     return false;
+  }
+  if (f.size() > MAX_PAYLOAD_SIZE) {
+    f.close();
+    setLastError("Payload file is too large");
+    return false;
+  }
+
   String content = f.readString();
   f.close();
   return duckyExecute(content, cb);
@@ -74,82 +180,137 @@ bool duckyIsRunning() { return sStatus == DuckyStatus::RUNNING; }
 
 DuckyStatus duckyGetStatus() { return sStatus; }
 
+String duckyGetLastError() {
+  if (sMutex && xSemaphoreTake(sMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    String error = sLastError;
+    xSemaphoreGive(sMutex);
+    return error;
+  }
+  return sLastError;
+}
+
 // ================================================================
-//  FreeRTOS Task — runs the script line-by-line
+//  FreeRTOS Task
 // ================================================================
 
 static void parserTask(void *param) {
-  // Split script into lines
-  std::vector<String> lines;
-  int start = 0;
-  int idx;
-  while ((idx = sScript.indexOf('\n', start)) != -1) {
-    lines.push_back(sScript.substring(start, idx));
-    start = idx + 1;
-  }
-  if (start < (int)sScript.length()) {
-    lines.push_back(sScript.substring(start));
+  String script;
+  if (xSemaphoreTake(sMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    script = sScript;
+    xSemaphoreGive(sMutex);
+  } else {
+    setLastError("Parser could not lock script state");
+    setStatus(DuckyStatus::ERROR);
+    sTaskHandle = nullptr;
+    vTaskDelete(nullptr);
+    return;
   }
 
-  int totalLines = lines.size();
-  int defaultDelay = DEFAULT_CMD_DELAY;
-  String lastLine = "";
+  int totalLines = countLines(script);
+  int currentLine = 0;
+  long defaultDelay = DEFAULT_CMD_DELAY;
+  String lastExecutableLine;
+  size_t cursor = 0;
 
   reportStatus(0, totalLines, DuckyStatus::RUNNING);
 
-  for (int i = 0; i < totalLines; i++) {
-    // Check abort flag
+  String line;
+  while (nextLine(script, cursor, line)) {
+    currentLine++;
     if (sAbort) {
       releaseAllKeys();
-      sStatus = DuckyStatus::ABORTED;
-      reportStatus(i, totalLines, DuckyStatus::ABORTED);
+      setStatus(DuckyStatus::ABORTED);
+      reportStatus(currentLine, totalLines, DuckyStatus::ABORTED);
       sTaskHandle = nullptr;
       vTaskDelete(nullptr);
       return;
     }
 
-    String line = lines[i];
-    line.trim();
-
-    if (line.length() == 0 || line.startsWith("REM") || line.startsWith("//")) {
-      continue; // skip blanks and comments
-    }
-
-    // Handle DEFAULT_DELAY / DEFAULTDELAY
-    if (line.startsWith("DEFAULT_DELAY ") || line.startsWith("DEFAULTDELAY ")) {
-      int spaceIdx = line.indexOf(' ');
-      defaultDelay = line.substring(spaceIdx + 1).toInt();
+    if (isCommentOrBlank(line)) {
       continue;
     }
 
-    // Handle REPEAT
-    if (line.startsWith("REPEAT")) {
+    String upper = line;
+    upper.toUpperCase();
+
+    if (upper.startsWith("DEFAULT_DELAY ") ||
+        upper.startsWith("DEFAULTDELAY ")) {
       int spaceIdx = line.indexOf(' ');
-      int count = (spaceIdx >= 0) ? line.substring(spaceIdx + 1).toInt() : 1;
-      if (count < 1)
-        count = 1;
-      for (int r = 0; r < count && !sAbort; r++) {
-        String dummy;
-        executeLine(lastLine, 0, dummy);
+      long parsedDelay = 0;
+      if (!parseLongInRange(line.substring(spaceIdx + 1), 0,
+                            MAX_COMMAND_DELAY_MS, parsedDelay)) {
+        setLastError("Invalid DEFAULT_DELAY at line " + String(currentLine));
+        setStatus(DuckyStatus::ERROR);
+        reportStatus(currentLine, totalLines, DuckyStatus::ERROR);
+        sTaskHandle = nullptr;
+        vTaskDelete(nullptr);
+        return;
       }
-      reportStatus(i + 1, totalLines, DuckyStatus::RUNNING);
+      defaultDelay = parsedDelay;
       continue;
     }
 
-    executeLine(line, defaultDelay, lastLine);
-    lastLine = line;
+    if (upper == "REPEAT" || upper.startsWith("REPEAT ")) {
+      long count = 0;
+      String countArg = line.length() > 6 ? line.substring(6) : "1";
+      if (!parseLongInRange(countArg, 1, 1000, count)) {
+        setLastError("Invalid REPEAT count at line " + String(currentLine));
+        setStatus(DuckyStatus::ERROR);
+        reportStatus(currentLine, totalLines, DuckyStatus::ERROR);
+        sTaskHandle = nullptr;
+        vTaskDelete(nullptr);
+        return;
+      }
+      if (lastExecutableLine.isEmpty()) {
+        setLastError("REPEAT has no previous command at line " +
+                     String(currentLine));
+        setStatus(DuckyStatus::ERROR);
+        reportStatus(currentLine, totalLines, DuckyStatus::ERROR);
+        sTaskHandle = nullptr;
+        vTaskDelete(nullptr);
+        return;
+      }
 
-    reportStatus(i + 1, totalLines, DuckyStatus::RUNNING);
+      for (long r = 0; r < count && !sAbort; r++) {
+        String error;
+        if (!executeLine(lastExecutableLine, error)) {
+          setLastError(error + " at line " + String(currentLine));
+          setStatus(DuckyStatus::ERROR);
+          reportStatus(currentLine, totalLines, DuckyStatus::ERROR);
+          sTaskHandle = nullptr;
+          vTaskDelete(nullptr);
+          return;
+        }
+        if (defaultDelay > 0 && !waitWithAbort(defaultDelay)) {
+          break;
+        }
+      }
+      reportStatus(currentLine, totalLines, DuckyStatus::RUNNING);
+      continue;
+    }
 
-    // Inter-command delay (non-blocking to other tasks)
-    if (defaultDelay > 0) {
-      vTaskDelay(pdMS_TO_TICKS(defaultDelay));
+    String error;
+    if (!executeLine(line, error)) {
+      releaseAllKeys();
+      setLastError(error + " at line " + String(currentLine));
+      setStatus(DuckyStatus::ERROR);
+      reportStatus(currentLine, totalLines, DuckyStatus::ERROR);
+      sTaskHandle = nullptr;
+      vTaskDelete(nullptr);
+      return;
+    }
+
+    lastExecutableLine = line;
+    reportStatus(currentLine, totalLines, DuckyStatus::RUNNING);
+
+    if (defaultDelay > 0 && !waitWithAbort(defaultDelay)) {
+      break;
     }
   }
 
   releaseAllKeys();
-  sStatus = DuckyStatus::FINISHED;
-  reportStatus(totalLines, totalLines, DuckyStatus::FINISHED);
+  setStatus(sAbort ? DuckyStatus::ABORTED : DuckyStatus::FINISHED);
+  reportStatus(totalLines, totalLines, duckyGetStatus());
   sTaskHandle = nullptr;
   vTaskDelete(nullptr);
 }
@@ -158,191 +319,129 @@ static void parserTask(void *param) {
 //  Command Execution
 // ================================================================
 
-static void executeLine(const String &line, int defaultDelay,
-                        String &lastLine) {
-  // --- DELAY ---
-  if (line.startsWith("DELAY ")) {
-    int ms = line.substring(6).toInt();
-    vTaskDelay(pdMS_TO_TICKS(ms));
-    return;
+static bool executeLine(const String &line, String &error) {
+  String upper = line;
+  upper.toUpperCase();
+
+  if (upper.startsWith("DELAY ")) {
+    long ms = 0;
+    if (!parseLongInRange(line.substring(6), 0, MAX_COMMAND_DELAY_MS, ms)) {
+      error = "Invalid DELAY";
+      return false;
+    }
+    return waitWithAbort(ms);
   }
 
-  // --- STRING ---
-  if (line.startsWith("STRING ")) {
+  if (upper.startsWith("STRING ")) {
     typeString(line.substring(7));
-    return;
+    return true;
   }
-  if (line.startsWith("STRINGLN ")) {
+  if (upper.startsWith("STRINGLN ")) {
     typeString(line.substring(9));
     pressKey(KEY_ENTER);
-    return;
+    return true;
   }
 
-  // --- MOUSE commands ---
-  if (line.startsWith("MOUSE_MOVE ")) {
+  if (upper.startsWith("MOUSE_MOVE ")) {
     String args = line.substring(11);
+    args.trim();
     int spaceIdx = args.indexOf(' ');
-    if (spaceIdx > 0) {
-      int8_t dx = (int8_t)args.substring(0, spaceIdx).toInt();
-      int8_t dy = (int8_t)args.substring(spaceIdx + 1).toInt();
-      mouseMove(dx, dy);
+    if (spaceIdx <= 0) {
+      error = "MOUSE_MOVE requires dx and dy";
+      return false;
     }
-    return;
+
+    long dx = 0;
+    long dy = 0;
+    if (!parseLongInRange(args.substring(0, spaceIdx), -127, 127, dx) ||
+        !parseLongInRange(args.substring(spaceIdx + 1), -127, 127, dy)) {
+      error = "MOUSE_MOVE values must be between -127 and 127";
+      return false;
+    }
+    mouseMove((int8_t)dx, (int8_t)dy);
+    return true;
   }
-  if (line.startsWith("MOUSE_CLICK")) {
-    String arg = line.substring(11);
+
+  if (upper == "MOUSE_CLICK" || upper.startsWith("MOUSE_CLICK ")) {
+    String arg = line.length() > 11 ? line.substring(11) : "";
     arg.trim();
-    if (arg.equalsIgnoreCase("RIGHT"))
-      mouseClick(1);
-    else if (arg.equalsIgnoreCase("MIDDLE"))
-      mouseClick(2);
-    else
+    arg.toUpperCase();
+    if (arg.isEmpty() || arg == "LEFT") {
       mouseClick(0);
-    return;
-  }
-  if (line.startsWith("MOUSE_SCROLL ")) {
-    int8_t amount = (int8_t)line.substring(13).toInt();
-    mouseScroll(amount);
-    return;
-  }
-
-  // --- Single keys ---
-  if (line == "ENTER" || line == "RETURN") {
-    pressKey(KEY_ENTER);
-    return;
-  }
-  if (line == "TAB") {
-    pressKey(KEY_TAB);
-    return;
-  }
-  if (line == "ESCAPE" || line == "ESC") {
-    pressKey(KEY_ESCAPE);
-    return;
-  }
-  if (line == "SPACE") {
-    pressKey(KEY_SPACE);
-    return;
-  }
-  if (line == "BACKSPACE" || line == "BKSP") {
-    pressKey(KEY_BACKSPACE);
-    return;
-  }
-  if (line == "DELETE" || line == "DEL") {
-    pressKey(KEY_DELETE);
-    return;
-  }
-  if (line == "INSERT") {
-    pressKey(KEY_INSERT);
-    return;
-  }
-  if (line == "HOME") {
-    pressKey(KEY_HOME);
-    return;
-  }
-  if (line == "END") {
-    pressKey(KEY_END);
-    return;
-  }
-  if (line == "PAGEUP") {
-    pressKey(KEY_PAGE_UP);
-    return;
-  }
-  if (line == "PAGEDOWN") {
-    pressKey(KEY_PAGE_DOWN);
-    return;
-  }
-  if (line == "UP" || line == "UPARROW") {
-    pressKey(KEY_UP_ARROW);
-    return;
-  }
-  if (line == "DOWN" || line == "DOWNARROW") {
-    pressKey(KEY_DOWN_ARROW);
-    return;
-  }
-  if (line == "LEFT" || line == "LEFTARROW") {
-    pressKey(KEY_LEFT_ARROW);
-    return;
-  }
-  if (line == "RIGHT" || line == "RIGHTARROW") {
-    pressKey(KEY_RIGHT_ARROW);
-    return;
-  }
-  if (line == "CAPSLOCK") {
-    pressKey(KEY_CAPSLOCK);
-    return;
-  }
-  if (line == "PRINTSCREEN") {
-    pressKey(KEY_PRINT_SCREEN);
-    return;
-  }
-  if (line == "SCROLLLOCK") {
-    pressKey(KEY_SCROLL_LOCK);
-    return;
-  }
-  if (line == "PAUSE" || line == "BREAK") {
-    pressKey(KEY_PAUSE);
-    return;
-  }
-  if (line == "NUMLOCK") {
-    pressKey(KEY_NUM_LOCK);
-    return;
-  }
-  if (line == "MENU" || line == "APP") {
-    pressKey(KEY_MENU);
-    return;
-  }
-
-  // --- Function keys ---
-  for (int f = 1; f <= 12; f++) {
-    if (line == "F" + String(f)) {
-      pressKey(KEY_F1 + f - 1);
-      return;
+    } else if (arg == "RIGHT") {
+      mouseClick(1);
+    } else if (arg == "MIDDLE") {
+      mouseClick(2);
+    } else {
+      error = "Unknown MOUSE_CLICK button";
+      return false;
     }
+    return true;
   }
 
-  // --- Modifier combos: GUI/WINDOWS, CTRL, ALT, SHIFT + key ---
-  // Supports:  GUI r   |   CTRL ALT DELETE   |   SHIFT TAB   etc.
+  if (upper.startsWith("MOUSE_SCROLL ")) {
+    long amount = 0;
+    if (!parseLongInRange(line.substring(13), -127, 127, amount)) {
+      error = "MOUSE_SCROLL value must be between -127 and 127";
+      return false;
+    }
+    mouseScroll((int8_t)amount);
+    return true;
+  }
+
+  uint8_t singleKey = resolveKey(upper);
+  if (singleKey != KEY_NONE && upper.indexOf(' ') < 0) {
+    pressKey(singleKey);
+    return true;
+  }
+
   uint8_t modMask = 0;
   String remaining = line;
 
-  // Parse modifier tokens from the front
-  while (remaining.length() > 0) {
-    String token;
+  while (!remaining.isEmpty()) {
+    remaining.trim();
     int spaceIdx = remaining.indexOf(' ');
-    if (spaceIdx >= 0) {
-      token = remaining.substring(0, spaceIdx);
-      remaining = remaining.substring(spaceIdx + 1);
-      remaining.trim();
-    } else {
-      token = remaining;
-      remaining = "";
-    }
+    String token =
+        spaceIdx >= 0 ? remaining.substring(0, spaceIdx) : remaining;
+    remaining = spaceIdx >= 0 ? remaining.substring(spaceIdx + 1) : "";
 
-    uint8_t mod = resolveModifier(token);
+    String upperToken = token;
+    upperToken.toUpperCase();
+    uint8_t mod = resolveModifier(upperToken);
     if (mod != MOD_NONE) {
       modMask |= mod;
-    } else {
-      // This token is the final key
-      uint8_t key = resolveKey(token);
-      if (key != KEY_NONE) {
-        pressKey(key, modMask);
-      } else if (token.length() == 1) {
-        // Single character — type it with modifiers
-        KeyMapping km = getKeyMapping(token.charAt(0));
-        pressKey(km.keycode, modMask | km.modifier);
-      }
-      return;
+      continue;
     }
+
+    uint8_t key = resolveKey(upperToken);
+    if (key != KEY_NONE) {
+      pressKey(key, modMask);
+      return true;
+    }
+
+    if (token.length() == 1) {
+      KeyMapping km = getKeyMapping(token.charAt(0));
+      if (km.keycode != KEY_NONE) {
+        pressKey(km.keycode, modMask | km.modifier);
+        return true;
+      }
+    }
+
+    error = "Unknown key or command";
+    return false;
   }
 
-  // If we only got modifiers with no final key (e.g. "GUI" alone)
   if (modMask != 0) {
     pressKey(KEY_NONE, modMask);
+    return true;
   }
+
+  error = "Unknown command";
+  return false;
 }
 
 // ================================================================
-//  Key & Modifier Resolution (DuckyScript names → HID codes)
+//  Key and Modifier Resolution
 // ================================================================
 
 static uint8_t resolveKey(const String &keyName) {
@@ -364,9 +463,9 @@ static uint8_t resolveKey(const String &keyName) {
     return KEY_HOME;
   if (keyName == "END")
     return KEY_END;
-  if (keyName == "PAGEUP")
+  if (keyName == "PAGEUP" || keyName == "PAGE_UP")
     return KEY_PAGE_UP;
-  if (keyName == "PAGEDOWN")
+  if (keyName == "PAGEDOWN" || keyName == "PAGE_DOWN")
     return KEY_PAGE_DOWN;
   if (keyName == "UP" || keyName == "UPARROW")
     return KEY_UP_ARROW;
@@ -376,26 +475,25 @@ static uint8_t resolveKey(const String &keyName) {
     return KEY_LEFT_ARROW;
   if (keyName == "RIGHT" || keyName == "RIGHTARROW")
     return KEY_RIGHT_ARROW;
-  if (keyName == "CAPSLOCK")
+  if (keyName == "CAPSLOCK" || keyName == "CAPS_LOCK")
     return KEY_CAPSLOCK;
-  if (keyName == "PRINTSCREEN")
+  if (keyName == "PRINTSCREEN" || keyName == "PRINT_SCREEN")
     return KEY_PRINT_SCREEN;
-  if (keyName == "SCROLLLOCK")
+  if (keyName == "SCROLLLOCK" || keyName == "SCROLL_LOCK")
     return KEY_SCROLL_LOCK;
   if (keyName == "PAUSE" || keyName == "BREAK")
     return KEY_PAUSE;
-  if (keyName == "NUMLOCK")
+  if (keyName == "NUMLOCK" || keyName == "NUM_LOCK")
     return KEY_NUM_LOCK;
   if (keyName == "MENU" || keyName == "APP")
     return KEY_MENU;
 
-  // Function keys
   for (int f = 1; f <= 12; f++) {
-    if (keyName == "F" + String(f))
+    if (keyName == "F" + String(f)) {
       return KEY_F1 + f - 1;
+    }
   }
 
-  // Single letter/digit
   if (keyName.length() == 1) {
     KeyMapping km = getKeyMapping(keyName.charAt(0));
     return km.keycode;

@@ -9,6 +9,9 @@
 /// Initialize USB HID (keyboard + mouse). Call once in setup().
 void initUSB();
 
+/// Return true after USB HID has been initialized.
+bool usbIsReady();
+
 /// Send ALT+SHIFT to switch host keyboard layout to English.
 void fixLayout();
 
