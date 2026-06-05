@@ -13,7 +13,7 @@
 
 // --- Wi-Fi Access Point ---
 #define WIFI_SSID_PREFIX "HIDLab_"
-#define WIFI_PASSWORD "change-this-pass"
+#define WIFI_PASSWORD "123456789m.M"
 #define WIFI_CHANNEL 1
 #define WIFI_MAX_CLIENTS 2
 
